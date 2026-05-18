@@ -1,37 +1,156 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
 // ─────────────────────────────────────────────
-// ⚠️ PASTE YOUR FINNHUB API KEY HERE
+// ⚠️ PASTE YOUR FINNHUB API KEY HERE (news feed)
 // ─────────────────────────────────────────────
 const FINNHUB_API_KEY = "YOUR_FINNHUB_API_KEY_HERE";
 
-// Fallback watchlist — used when gapper scan returns nothing
-const FALLBACK_WATCHLIST = ["NKTR", "GME", "MARA", "SOUN", "CELH", "BYND", "XTIA", "CLPS", "REBN", "MDJH"];
+// ─────────────────────────────────────────────
+// Railway backend — secure proxy for Massive API
+// All price data flows through here
+// ─────────────────────────────────────────────
+const BACKEND = "https://rj-backend-production.up.railway.app";
 
-// How many gappers to discover (top 20 under $500M mkt cap)
-const GAPPER_SCAN_LIMIT = 20;
-// How many of those top gappers we fetch news for (top 10 by gap %)
-const NEWS_TICKER_LIMIT = 10;
-// Market cap ceiling for gapper filter — $500M
-const MKTCAP_MAX = 500_000_000;
+// Refresh intervals
+const GAPPER_REFRESH_MS  = 5 * 60_000;  // gapper scan every 5 min
+const QUOTE_REFRESH_MS   = 30_000;       // quotes every 30 sec
+const NEWS_REFRESH_MS    = 60_000;       // news every 60 sec
+const NEWS_TICKER_LIMIT  = 10;           // fetch news for top 10 gappers
 
-// News refresh — 60 seconds
-const NEWS_REFRESH_MS = 60_000;
-// Gapper scan refresh — 5 minutes
-const GAPPER_SCAN_MS = 5 * 60_000;
+// Fallback watchlist — used when backend scan returns nothing
+const FALLBACK_WATCHLIST = ["NKTR","GME","MARA","SOUN","CELH","BYND","XTIA","CLPS","REBN","MDJH"];
 
 // ─────────────────────────────────────────────
-// MOCK DATA — Panels 1–4 and 6 (Phase 2 only)
-// Real data connections happen in Phase 3+
+// SCORING ENGINE — runs on live gapper data
+// ─────────────────────────────────────────────
+
+// Detect likely track from available signals
+function detectTrack(g) {
+  const floatM = (g.float || 0) / 1_000_000;
+  const rvol   = g.rvol || 0;
+  const chg    = g.changePercent || 0;
+  // Pump signals: tiny float, extreme RVOL, big move, no catalyst tag
+  if (floatM < 10 && rvol > 15 && chg > 20 && !g.tags?.length) return "P";
+  return "C1";
+}
+
+// Catalyst score 0–100
+function scoreGapper(g) {
+  let score = 0;
+  const floatM  = (g.float || 0) / 1_000_000;
+  const rvol    = g.rvol   || 0;
+  const chgPct  = Math.abs(g.changePercent || 0);
+  const vol     = g.volume || 0;
+
+  // Gap % — up to 20pts
+  score += Math.min(20, chgPct * 0.5);
+  // RVOL — up to 20pts
+  score += Math.min(20, rvol * 2);
+  // Float — up to 15pts (smaller = better)
+  if (floatM < 5)        score += 15;
+  else if (floatM < 20)  score += 12;
+  else if (floatM < 50)  score += 8;
+  else if (floatM < 200) score += 4;
+  // Volume — up to 15pts
+  if (vol > 10_000_000)      score += 15;
+  else if (vol > 5_000_000)  score += 10;
+  else if (vol > 1_000_000)  score += 5;
+  // PMH painted bonus — 10pts
+  if (g.pmhPainted) score += 10;
+  // MDP candidate bonus — 10pts
+  if (g.mdpCandidate) score += 10;
+  // Cap at 100
+  return Math.min(100, Math.round(score));
+}
+
+// Setup grade A/B/C/D
+function calcGrade(g, score) {
+  const floatM = (g.float || 0) / 1_000_000;
+  const rvol   = g.rvol || 0;
+  if (score >= 80 && g.pmhPainted && floatM < 50 && rvol >= 10) return "A";
+  if (score >= 60) return "B";
+  if (score >= 45) return "C";
+  return "D";
+}
+
+// Format float for display
+function fmtFloat(shares) {
+  if (!shares) return "—";
+  const m = shares / 1_000_000;
+  return m >= 1000 ? `${(m/1000).toFixed(1)}B` : `${m.toFixed(1)}M`;
+}
+
+// Format market cap
+function fmtMktCap(n) {
+  if (!n) return "—";
+  if (n >= 1e9) return `$${(n/1e9).toFixed(1)}B`;
+  return `$${(n/1e6).toFixed(0)}M`;
+}
+
+// MDP candidate auto-detection from intraday data
+function buildMdpSignals(g, intraday) {
+  if (!intraday) return null;
+  const mdp      = intraday.mdp;
+  const floatM   = (g.float || 0) / 1_000_000;
+  const vol      = g.volume || 0;
+  const score    = g.score || 0;
+
+  const volOk    = vol >= 5_000_000;
+  const catOk    = score >= 70;
+  const aboveOpen= mdp?.aboveOpen || false;
+  const aboveHS  = mdp?.aboveHalfSpike || false;
+  const baseMin  = mdp?.baseMinutes || 0;
+  const baseOk   = baseMin >= 45;
+  const floatOk  = floatM < 50;
+
+  const autoPass = [volOk, catOk, aboveOpen, aboveHS, baseOk, floatOk].filter(Boolean).length;
+  const halfSpike= mdp?.halfSpike || 0;
+  const open     = mdp?.sessionOpen || 0;
+  const high     = mdp?.sessionHigh || 0;
+  const price    = mdp?.currentPrice || 0;
+
+  // Spike bar: where is price between open and high?
+  const fillPct  = high > open
+    ? Math.min(100, Math.round(((price - open) / (high - open)) * 100))
+    : 0;
+
+  return {
+    autoSignals: [
+      { label:"Volume above 5M shares",           state: volOk?"y":"n",  value: vol ? `${(vol/1e6).toFixed(1)}M ${volOk?"✓":"✗"}` : "—" },
+      { label:"Strong catalyst (rater score 70+)", state: catOk?"y":"n",  value: `Score ${score} ${catOk?"✓":"✗"}` },
+      { label:"Price above open price",            state: aboveOpen?"y":aboveOpen===false?"n":"q", value: open ? `$${price?.toFixed(2)} > $${open?.toFixed(2)} ${aboveOpen?"✓":"✗"}` : "—" },
+      { label:"Price held above ½-spike level",    state: aboveHS?"y":"n",value: halfSpike ? `$${price?.toFixed(2)} > $${halfSpike?.toFixed(2)} ${aboveHS?"✓":"✗"}` : "—" },
+      { label:"Tight consolidation range >45min",  state: baseOk?"y":baseMin>30?"q":"n", value: baseMin ? `${baseMin}min ${baseOk?"✓":"— wait"}` : "—" },
+      { label:"Float — smaller is stronger signal",state: floatOk?"y":"q",value: fmtFloat(g.float) + (floatOk?" ✓":" · large") },
+    ],
+    manualSignals:[{ label:"Clean chart — no overhead supply", value:"Check TWS" }],
+    spike:{
+      open:  open  ? `$${open.toFixed(2)}`      : "—",
+      half:  halfSpike ? `$${halfSpike.toFixed(2)}` : "—",
+      high:  high  ? `$${high.toFixed(2)}`      : "—",
+      label: halfSpike ? `½-Spike $${halfSpike.toFixed(2)}` : "½-Spike",
+      held:  aboveHS,
+      fillPct,
+    },
+    autoPass,
+    score: `${autoPass}/6`,
+    status: autoPass >= 5 ? "basing" : autoPass >= 4 ? "watch" : "watch",
+    isMdpCandidate: autoPass >= 4,
+  };
+}
+
+// ─────────────────────────────────────────────
+// STATIC FALLBACK DATA — shown while loading
+// or when market is closed
 // ─────────────────────────────────────────────
 const MOCK_GAPPERS = [
   { rank:1, sym:"NKTR", tags:["FDA","MDP"], float:"124M", rotation:"71%", gain:"+41.8%", gainPos:true, pmhPainted:true, pmhLevel:"$9.42", grade:"A", score:94, track:"MDP" },
-  { rank:2, sym:"XTIA", tags:["Pump"],     float:"3.2M", rotation:"388%",gain:"+84.2%", gainPos:true, pmhPainted:true, pmhLevel:"$2.18", grade:"A", score:88, track:"P" },
-  { rank:3, sym:"GME",  tags:["Sqze"],     float:"304M", rotation:"24%", gain:"+18.3%", gainPos:true, pmhPainted:true, pmhLevel:"$21.40",grade:"B", score:78, track:"C1" },
-  { rank:4, sym:"SOUN", tags:["8-K","MDP"],float:"8.2M", rotation:"18%", gain:"+9.1%",  gainPos:true, pmhPainted:false,pmhLevel:"$7.88", grade:"B", score:71, track:"MDP" },
-  { rank:5, sym:"MARA", tags:["Macro"],    float:"312M", rotation:"11%", gain:"+14.6%", gainPos:true, pmhPainted:false,pmhLevel:"$23.80",grade:"B", score:64, track:"C1" },
-  { rank:6, sym:"CELH", tags:["Earn"],     float:"224M", rotation:"8%",  gain:"+7.8%",  gainPos:true, pmhPainted:false,pmhLevel:"$33.20",grade:"C", score:51, track:"C1" },
-  { rank:7, sym:"BYND", tags:["Earn"],     float:"62M",  rotation:"5%",  gain:"−11.4%", gainPos:false,pmhPainted:false,pmhLevel:"$4.88", grade:"D", score:28, track:"C1" },
+  { rank:2, sym:"XTIA", tags:["Pump"],      float:"3.2M", rotation:"388%",gain:"+84.2%", gainPos:true, pmhPainted:true, pmhLevel:"$2.18", grade:"A", score:88, track:"P"   },
+  { rank:3, sym:"GME",  tags:["Sqze"],      float:"304M", rotation:"24%", gain:"+18.3%", gainPos:true, pmhPainted:true, pmhLevel:"$21.40",grade:"B", score:78, track:"C1"  },
+  { rank:4, sym:"SOUN", tags:["8-K","MDP"], float:"8.2M", rotation:"18%", gain:"+9.1%",  gainPos:true, pmhPainted:false,pmhLevel:"$7.88", grade:"B", score:71, track:"MDP" },
+  { rank:5, sym:"MARA", tags:["Macro"],     float:"312M", rotation:"11%", gain:"+14.6%", gainPos:true, pmhPainted:false,pmhLevel:"$23.80",grade:"B", score:64, track:"C1"  },
+  { rank:6, sym:"CELH", tags:["Earn"],      float:"224M", rotation:"8%",  gain:"+7.8%",  gainPos:true, pmhPainted:false,pmhLevel:"$33.20",grade:"C", score:51, track:"C1"  },
+  { rank:7, sym:"BYND", tags:["Earn"],      float:"62M",  rotation:"5%",  gain:"−11.4%", gainPos:false,pmhPainted:false,pmhLevel:"$4.88", grade:"D", score:28, track:"C1"  },
 ];
 
 const MOCK_PUMPS = [
@@ -43,48 +162,205 @@ const MOCK_PUMPS = [
 ];
 
 const MOCK_CATALYST_ROWS = [
-  { sym:"NKTR", track:"MDP",  score:94, barPct:94,  barColor:"linear-gradient(90deg,#f97316,#22d3ee)", badge:"mdp",  factors:"Cat 30 · Gap 19 · RVOL 20 · Float 11 · Src 14 · PMH ✓ · MDP 6/6" },
-  { sym:"XTIA", track:"P",    score:88, barPct:88,  barColor:"linear-gradient(90deg,#f5a623,#ff4d6a)", badge:"pa",   factors:"Float 25 · RVOL 25 · Country 15 · Prior 13 · SI 10" },
-  { sym:"GME",  track:"C1",   score:78, barPct:78,  barColor:"linear-gradient(90deg,#f5a623,#00d68f)", badge:"warm", factors:"Cat 10 · Gap 18 · RVOL 20 · SI 28% · PMH ✓" },
-  { sym:"SOUN", track:"MDP",  score:71, barPct:71,  barColor:"linear-gradient(90deg,#f97316,#4d9fff)", badge:"mdp",  factors:"Cat 18 · Gap 10 · RVOL 16 · Float 8.2M · MDP 5/6" },
-  { sym:"MARA", track:"C1",   score:64, barPct:64,  barColor:"#4d9fff",                               badge:"cool", factors:"Cat 18 · Gap 14 · RVOL 8x · Float 312M" },
-  { sym:"CLPS", track:"P",    score:76, barPct:76,  barColor:"#f5a623",                               badge:"pf",   factors:"Float 24 · RVOL 22 · Country 15 · Prior ×4" },
+  { sym:"NKTR", track:"MDP", score:94, barPct:94, barColor:"linear-gradient(90deg,#f97316,#22d3ee)", badge:"mdp",  factors:"Cat 30 · Gap 19 · RVOL 20 · Float 11 · Src 14 · PMH ✓ · MDP 6/6" },
+  { sym:"XTIA", track:"P",   score:88, barPct:88, barColor:"linear-gradient(90deg,#f5a623,#ff4d6a)", badge:"pa",   factors:"Float 25 · RVOL 25 · Country 15 · Prior 13 · SI 10" },
+  { sym:"GME",  track:"C1",  score:78, barPct:78, barColor:"linear-gradient(90deg,#f5a623,#00d68f)", badge:"warm", factors:"Cat 10 · Gap 18 · RVOL 20 · SI 28% · PMH ✓" },
+  { sym:"SOUN", track:"MDP", score:71, barPct:71, barColor:"linear-gradient(90deg,#f97316,#4d9fff)", badge:"mdp",  factors:"Cat 18 · Gap 10 · RVOL 16 · Float 8.2M · MDP 5/6" },
+  { sym:"MARA", track:"C1",  score:64, barPct:64, barColor:"#4d9fff",                               badge:"cool", factors:"Cat 18 · Gap 14 · RVOL 8x · Float 312M" },
+  { sym:"CLPS", track:"P",   score:76, barPct:76, barColor:"#f5a623",                               badge:"pf",   factors:"Float 24 · RVOL 22 · Country 15 · Prior ×4" },
 ];
 
 const MDP_CANDIDATES = [
   {
     sym:"NKTR", tag:"FDA", status:"basing",
     autoSignals:[
-      { label:"Volume above 5M shares",           state:"y", value:"18.2M ✓",        ok:true  },
-      { label:"Strong catalyst (rater score 70+)", state:"y", value:"Score 94 ✓",     ok:true  },
-      { label:"Price above open price",            state:"y", value:"$8.74 > $5.18 ✓",ok:true  },
-      { label:"Price held above ½-spike level",    state:"y", value:"$8.74 > $6.21 ✓",ok:true  },
-      { label:"Tight consolidation range >45min",  state:"q", value:"58min · $0.38 rng",ok:false },
-      { label:"Float — smaller is stronger signal",state:"q", value:"124M · large",   ok:false },
+      { label:"Volume above 5M shares",           state:"y", value:"18.2M ✓" },
+      { label:"Strong catalyst (rater score 70+)", state:"y", value:"Score 94 ✓" },
+      { label:"Price above open price",            state:"y", value:"$8.74 > $5.18 ✓" },
+      { label:"Price held above ½-spike level",    state:"y", value:"$8.74 > $6.21 ✓" },
+      { label:"Tight consolidation range >45min",  state:"q", value:"58min · building" },
+      { label:"Float — smaller is stronger signal",state:"q", value:"124M · large" },
     ],
-    manualSignals:[
-      { label:"Clean chart — no overhead supply",  value:"Check TWS" },
-    ],
-    spike:{ open:"$5.18", half:"$6.21", high:"$9.42", label:"½-Spike level $6.21", held:true, fillPct:78 },
+    manualSignals:[{ label:"Clean chart — no overhead supply", value:"Check TWS" }],
+    spike:{ open:"$5.18", half:"$6.21", high:"$9.42", label:"½-Spike $6.21", held:true, fillPct:78 },
     score:"6/7", entry:"$7.20 BO", stop:"$6.55", countdownLabel:"48min",
   },
   {
     sym:"SOUN", tag:"8-K", status:"watch",
     autoSignals:[
-      { label:"Volume above 5M shares",           state:"y", value:"6.1M ✓",          ok:true  },
-      { label:"Strong catalyst (rater score 70+)", state:"y", value:"Score 71 ✓",      ok:true  },
-      { label:"Price above open price",            state:"q", value:"$7.33 > $6.71 · slim",ok:false },
-      { label:"Price held above ½-spike level",    state:"y", value:"$7.33 > $6.88 ✓", ok:true  },
-      { label:"Tight consolidation range >45min",  state:"n", value:"34min — wait",    ok:false },
-      { label:"Float — smaller is stronger signal",state:"y", value:"8.2M ✓",          ok:true  },
+      { label:"Volume above 5M shares",           state:"y", value:"6.1M ✓" },
+      { label:"Strong catalyst (rater score 70+)", state:"y", value:"Score 71 ✓" },
+      { label:"Price above open price",            state:"q", value:"$7.33 > $6.71 · slim" },
+      { label:"Price held above ½-spike level",    state:"y", value:"$7.33 > $6.88 ✓" },
+      { label:"Tight consolidation range >45min",  state:"n", value:"34min — wait" },
+      { label:"Float — smaller is stronger signal",state:"y", value:"8.2M ✓" },
     ],
-    manualSignals:[
-      { label:"Clean chart — no overhead supply",  value:"Check TWS" },
-    ],
-    spike:{ open:"$6.71", half:"$6.88", high:"$7.94", label:"½-Spike level $6.88", held:true, fillPct:65, gradient:"linear-gradient(90deg,#22d3ee,#4d9fff)" },
+    manualSignals:[{ label:"Clean chart — no overhead supply", value:"Check TWS" }],
+    spike:{ open:"$6.71", half:"$6.88", high:"$7.94", label:"½-Spike $6.88", held:true, fillPct:65, gradient:"linear-gradient(90deg,#22d3ee,#4d9fff)" },
     score:"5/7", entry:null, stop:null, countdownLabel:null,
   },
 ];
+
+// ─────────────────────────────────────────────
+// LIVE DATA HOOK — fetches from Railway backend
+// Returns: gappers, mdpCandidates, pumps,
+//          catalystRows, dataSource, lastUpdate
+// ─────────────────────────────────────────────
+function useLiveData() {
+  const [gappers,       setGappers]       = useState(MOCK_GAPPERS);
+  const [mdpCandidates, setMdpCandidates] = useState(MDP_CANDIDATES);
+  const [pumps,         setPumps]         = useState(MOCK_PUMPS);
+  const [catalystRows,  setCatalystRows]  = useState(MOCK_CATALYST_ROWS);
+  const [dataSource,    setDataSource]    = useState("mock"); // "mock"|"live"|"error"
+  const [lastUpdate,    setLastUpdate]    = useState(null);
+  const [watchlist,     setWatchlist]     = useState(FALLBACK_WATCHLIST);
+
+  const processGappers = useCallback(async (rawGappers) => {
+    if (!rawGappers?.length) return;
+
+    // For each gapper fetch PMH and intraday in parallel (top 7 only to stay fast)
+    const top = rawGappers.slice(0, 7);
+    const [pmhResults, intradayResults] = await Promise.all([
+      Promise.allSettled(top.map(g =>
+        fetch(`${BACKEND}/api/pmh/${g.sym}`).then(r => r.json())
+      )),
+      Promise.allSettled(top.map(g =>
+        fetch(`${BACKEND}/api/intraday/${g.sym}`).then(r => r.json())
+      )),
+    ]);
+
+    const enriched = top.map((g, i) => {
+      const pmh      = pmhResults[i].status==="fulfilled" ? pmhResults[i].value?.data : null;
+      const intraday = intradayResults[i].status==="fulfilled" ? intradayResults[i].value?.data : null;
+      const chgPct   = g.changePercent || 0;
+      const floatM   = (g.float || 0) / 1_000_000;
+      const vol      = g.volume || 0;
+      const rvol     = g.rvol || 0;
+
+      // PM Rotation % = premarket volume / float * 100
+      const rotPct = g.float && vol ? Math.round((vol / g.float) * 100) : null;
+
+      // MDP signals from intraday
+      const mdpSig = buildMdpSignals(g, intraday);
+
+      // Score
+      const enrichedG = { ...g, pmhPainted: pmh?.painted || false, mdpCandidate: mdpSig?.isMdpCandidate || false };
+      const score  = scoreGapper(enrichedG);
+      const grade  = calcGrade(enrichedG, score);
+      const track  = detectTrack(enrichedG);
+
+      // Tags
+      const tags = [];
+      if (track === "P") tags.push("Pump");
+      if (mdpSig?.isMdpCandidate) tags.push("MDP");
+
+      return {
+        rank:      i + 1,
+        sym:       g.sym,
+        tags,
+        float:     fmtFloat(g.float),
+        floatRaw:  g.float,
+        rotation:  rotPct != null ? `${rotPct}%` : "—",
+        gain:      chgPct >= 0 ? `+${chgPct.toFixed(1)}%` : `${chgPct.toFixed(1)}%`,
+        gainPos:   chgPct >= 0,
+        pmhPainted:pmh?.painted || false,
+        pmhLevel:  pmh?.pmhPrice ? `$${pmh.pmhPrice.toFixed(2)}` : "—",
+        grade,
+        score,
+        track,
+        rvol,
+        mdpSignals:mdpSig,
+        intraday,
+        marketCap: g.marketCap,
+      };
+    });
+
+    setGappers(enriched);
+
+    // Build catalyst rows from enriched gappers
+    const cRows = enriched.map(g => {
+      const isMdp  = g.track==="MDP" || g.tags.includes("MDP");
+      const isPump = g.track==="P";
+      const barColor = isMdp ? "linear-gradient(90deg,#f97316,#22d3ee)"
+        : isPump ? "linear-gradient(90deg,#f5a623,#ff4d6a)"
+        : g.score >= 70 ? "linear-gradient(90deg,#f5a623,#00d68f)"
+        : "#4d9fff";
+      const badge = isMdp ? "mdp" : isPump && g.score>=75 ? "pa" : isPump ? "pf"
+        : g.score>=80 ? "hot" : g.score>=55 ? "warm" : "cool";
+      const track = isMdp ? "MDP" : isPump ? "P" : "C1";
+      const factors = [
+        g.gain && `Gap ${g.gain}`,
+        g.rvol && `RVOL ${g.rvol}x`,
+        g.float && `Float ${g.float}`,
+        g.pmhPainted && "PMH ✓",
+        isMdp && `MDP ${g.mdpSignals?.score || ""}`,
+      ].filter(Boolean).join(" · ");
+
+      return { sym:g.sym, track, score:g.score, barPct:g.score, barColor, badge, factors };
+    });
+    setCatalystRows(cRows);
+
+    // Build MDP candidates from enriched gappers
+    const mdpList = enriched
+      .filter(g => g.mdpSignals?.isMdpCandidate)
+      .map(g => ({
+        sym:          g.sym,
+        tag:          g.tags.find(t=>t!=="MDP") || "Gap",
+        status:       g.mdpSignals.status,
+        autoSignals:  g.mdpSignals.autoSignals,
+        manualSignals:g.mdpSignals.manualSignals,
+        spike:        g.mdpSignals.spike,
+        score:        g.mdpSignals.score,
+        entry:        null,
+        stop:         null,
+        countdownLabel:null,
+      }));
+    if (mdpList.length) setMdpCandidates(mdpList);
+
+    // Build pump list
+    const pumpList = enriched
+      .filter(g => g.track==="P" || g.tags.includes("Pump"))
+      .map((g, i) => ({
+        rank:    i + 1,
+        sym:     g.sym,
+        country: "US",
+        float:   g.float,
+        rvol:    g.rvol ? `${g.rvol}x` : "—",
+        prior:   "0×",
+        chg:     g.gain,
+        chgPos:  g.gainPos,
+        badge:   g.score >= 75 ? "active" : "watch",
+      }));
+    if (pumpList.length) setPumps(pumpList);
+
+    setWatchlist(enriched.map(g => g.sym));
+    setDataSource("live");
+    setLastUpdate(new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false,timeZone:"America/New_York"}));
+  }, []);
+
+  const fetchGappers = useCallback(async () => {
+    try {
+      const res  = await fetch(`${BACKEND}/api/gappers`);
+      const json = await res.json();
+      if (json.ok && json.data?.length) {
+        await processGappers(json.data);
+      } else {
+        setDataSource("error");
+      }
+    } catch(e) {
+      console.error("Backend fetch failed:", e.message);
+      setDataSource("error");
+    }
+  }, [processGappers]);
+
+  useEffect(() => {
+    fetchGappers();
+    const iv = setInterval(fetchGappers, GAPPER_REFRESH_MS);
+    return () => clearInterval(iv);
+  }, [fetchGappers]);
+
+  return { gappers, mdpCandidates, pumps, catalystRows, dataSource, lastUpdate, watchlist };
+}
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -309,7 +585,7 @@ function TWSTip({ children, mdp=false }) {
 // ─────────────────────────────────────────────
 // PANEL 1 — GAPPER SCANNER
 // ─────────────────────────────────────────────
-function GapperScanner({ mdpFilter, setMdpFilter }) {
+function GapperScanner({ mdpFilter, setMdpFilter, gappers, dataSource, lastUpdate }) {
   const [selected, setSelected] = useState(0);
   const [activeFilter, setActiveFilter] = useState("All");
 
@@ -332,7 +608,7 @@ function GapperScanner({ mdpFilter, setMdpFilter }) {
 
   const filters = ["All","FDA","Earn","Sqze","8-K","⚠ Pump","⬡ MDP","Grade A"];
 
-  const visible = MOCK_GAPPERS.filter(r => {
+  const visible = gappers.filter(r => {
     if (mdpFilter) return r.tags.includes("MDP");
     if (activeFilter === "All") return true;
     if (activeFilter === "FDA")     return r.tags.includes("FDA");
@@ -357,6 +633,9 @@ function GapperScanner({ mdpFilter, setMdpFilter }) {
         <div style={{ display:"flex", gap:4 }}>
           <Badge variant="live">Massive</Badge>
           <Badge variant="live">Finviz</Badge>
+          {dataSource==="live" && lastUpdate && <Badge variant="live">{lastUpdate}</Badge>}
+          {dataSource==="mock" && <Badge variant="default">MOCK</Badge>}
+          {dataSource==="error" && <Badge variant="pump">ERROR</Badge>}
         </div>
       </div>
 
@@ -453,7 +732,7 @@ function GapperScanner({ mdpFilter, setMdpFilter }) {
 // ─────────────────────────────────────────────
 // PANEL 2 — CATALYST RATER
 // ─────────────────────────────────────────────
-function CatalystRater() {
+function CatalystRater({ catalystRows, dataSource }) {
   const badgeStyle = {
     mdp:  { bg:"rgba(249,115,22,0.07)",  color:"#f97316", border:"rgba(249,115,22,0.22)",  label:"⬡ MDP",    anim:true  },
     pa:   { bg:"rgba(245,166,35,0.1)",   color:"#f5a623", border:"rgba(245,166,35,0.32)",  label:"⚠ Active"  },
@@ -496,7 +775,7 @@ function CatalystRater() {
       })}
 
       <div style={{ ...S.pscroll, marginTop:4 }}>
-        {MOCK_CATALYST_ROWS.map(r => {
+        {catalystRows.map(r => {
           const b = badgeStyle[r.badge];
           const isMdp = r.track==="MDP";
           const isPump = r.track==="P";
@@ -558,7 +837,7 @@ function CatalystRater() {
 // ─────────────────────────────────────────────
 // PANEL 3 — MDP WATCH
 // ─────────────────────────────────────────────
-function MdpWatch({ windowStatus }) {
+function MdpWatch({ windowStatus, mdpCandidates }) {
   const dotClass = { y:"#00d68f", n:"#ff4d6a", q:"#f5a623", m:"#3d5166" };
   const dotBg    = { y:"rgba(0,214,143,0.25)", n:"rgba(255,77,106,0.15)", q:"rgba(245,166,35,0.15)", m:"rgba(61,81,102,0.3)" };
 
@@ -582,7 +861,7 @@ function MdpWatch({ windowStatus }) {
       </div>
 
       <div style={S.pscroll}>
-        {MDP_CANDIDATES.map(card => {
+        {mdpCandidates.map(card => {
           const isBasing = card.status==="basing";
           return (
             <div key={card.sym} style={{ margin:"8px 10px", borderRadius:6, overflow:"hidden",
@@ -675,7 +954,7 @@ function MdpWatch({ windowStatus }) {
 // ─────────────────────────────────────────────
 // PANEL 4 — PUMP SCANNER
 // ─────────────────────────────────────────────
-function PumpScanner() {
+function PumpScanner({ pumps, dataSource }) {
   const badgeMap = {
     active: { bg:"rgba(245,166,35,0.1)",  color:"#f5a623", border:"rgba(245,166,35,0.32)", label:"⚠ Active" },
     fading: { bg:"rgba(255,77,106,0.08)", color:"#ff4d6a", border:"rgba(255,77,106,0.22)", label:"⚠ Fading" },
@@ -711,7 +990,7 @@ function PumpScanner() {
       </div>
 
       <div style={S.pscroll}>
-        {MOCK_PUMPS.map(r => {
+        {pumps.map(r => {
           const b = badgeMap[r.badge];
           const isActive = r.badge==="active";
           const isFading = r.badge==="fading";
@@ -749,166 +1028,40 @@ function PumpScanner() {
 
 // ─────────────────────────────────────────────
 // PANEL 5 — NEWS FEED (LIVE via Finnhub)
-// Watchlist is auto-built from top 20 premarket
-// gappers under $500M market cap, refreshed every
-// 5 minutes. News fetched for the top 10 by gap %.
-// ─────────────────────────────────────────────
 
-// Step 1: Fetch top premarket gappers from Finnhub screener,
-// filter to under $500M market cap, return top 20 by change %.
-async function fetchTopGappers() {
-  // Finnhub stock screener — US exchange, sorted by change
-  const url = `https://finnhub.io/api/v1/stock/market-status?exchange=US&token=${FINNHUB_API_KEY}`;
-
-  // Use the scanner endpoint for premarket movers
-  const scanUrl = `https://finnhub.io/api/v1/scan/technical-indicator?exchange=US&resolution=D&token=${FINNHUB_API_KEY}`;
-
-  // Finnhub's quote screener for US stocks sorted by premarket change
-  // We request the top movers from their US market scanner
-  const moversUrl = `https://finnhub.io/api/v1/stock/market-status?exchange=US&token=${FINNHUB_API_KEY}`;
-
-  // The correct endpoint for scanning premarket movers with market cap filter:
-  // /api/v1/scan/technical-indicator returns symbols with recent activity
-  // We cross-reference with basic financials for market cap
-  const r = await fetch(
-    `https://finnhub.io/api/v1/stock/symbol?exchange=US&token=${FINNHUB_API_KEY}`
-  );
-  if (!r.ok) throw new Error("Screener fetch failed");
-
-  // Finnhub news endpoint gives us recently active tickers with quotes
-  // Use the US market news endpoint to identify active tickers, then get quotes
-  // Real gapper scan: fetch top movers via their market screener
-  const screenResp = await fetch(
-    `https://finnhub.io/api/v1/screener/ai?token=${FINNHUB_API_KEY}`
-  );
-
-  // Finnhub free tier: use their US market snapshot for top movers
-  // The most reliable free-tier approach is fetching quotes for known active tickers
-  // and using general news to surface new symbols — full scanner needs Finnhub premium
-  // So we use their news feed to extract active tickers, then apply mktcap filter
-
-  // Fetch today's market news to extract active tickers
-  const today = new Date().toISOString().slice(0, 10);
-  const newsResp = await fetch(
-    `https://finnhub.io/api/v1/news?category=general&minId=0&token=${FINNHUB_API_KEY}`
-  );
-  if (!newsResp.ok) throw new Error("News screener failed");
-  const newsData = await newsResp.json();
-
-  // Extract unique tickers mentioned in recent news
-  const tickersFromNews = [...new Set(
-    newsData
-      .filter(n => n.related)
-      .flatMap(n => n.related.split(",").map(t => t.trim().toUpperCase()))
-      .filter(t => t.length >= 1 && t.length <= 5 && /^[A-Z]+$/.test(t))
-  )].slice(0, 40);
-
-  if (tickersFromNews.length === 0) return null; // trigger fallback
-
-  // Fetch quotes for all candidate tickers in parallel
-  const quoteResults = await Promise.allSettled(
-    tickersFromNews.map(sym =>
-      fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_API_KEY}`)
-        .then(r => r.json())
-        .then(q => ({ sym, ...q }))
-    )
-  );
-
-  const quotes = quoteResults
-    .filter(r => r.status === "fulfilled" && r.value.dp != null)
-    .map(r => r.value);
-
-  // Fetch basic financials (market cap) for candidates showing positive premarket change
-  const activeQuotes = quotes
-    .filter(q => q.dp > 2) // at least 2% change to be worth checking
-    .sort((a, b) => b.dp - a.dp)
-    .slice(0, 25); // check top 25 for mktcap before final filter
-
-  const profileResults = await Promise.allSettled(
-    activeQuotes.map(q =>
-      fetch(`https://finnhub.io/api/v1/stock/profile2?symbol=${q.sym}&token=${FINNHUB_API_KEY}`)
-        .then(r => r.json())
-        .then(p => ({ sym: q.sym, mktCap: p.marketCapitalization * 1_000_000, change: q.dp }))
-    )
-  );
-
-  const qualified = profileResults
-    .filter(r => r.status === "fulfilled" && r.value.mktCap > 0 && r.value.mktCap < MKTCAP_MAX)
-    .map(r => r.value)
-    .sort((a, b) => b.change - a.change)
-    .slice(0, GAPPER_SCAN_LIMIT);
-
-  return qualified.length > 0 ? qualified : null;
-}
-
-function NewsFeed() {
+function NewsFeed({ watchlist: externalWatchlist, dataSource: parentDataSource }) {
   const [activeTab, setActiveTab] = useState("All");
   const [news, setNews] = useState([]);
-  const [watchlist, setWatchlist] = useState(FALLBACK_WATCHLIST);
-  const [scanStatus, setScanStatus] = useState("init"); // "init" | "live" | "fallback" | "error"
-  const [scanCount, setScanCount] = useState(0);       // how many gappers found
-  const [lastScan, setLastScan] = useState(null);       // HH:MM of last scan
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const isMock = FINNHUB_API_KEY === "YOUR_FINNHUB_API_KEY_HERE";
+  // Use externally-discovered watchlist from live gapper data, fall back to default
+  const watchlist = externalWatchlist?.length ? externalWatchlist : FALLBACK_WATCHLIST;
 
-  // Step 1: Scan for top gappers, update watchlist
-  const runGapperScan = useCallback(async () => {
-    if (isMock) return;
+  const fetchNews = useCallback(async () => {
+    if (isMock) { setNews(MOCK_NEWS); setLoading(false); return; }
     try {
-      const gappers = await fetchTopGappers();
-      if (gappers && gappers.length > 0) {
-        const syms = gappers.map(g => g.sym);
-        setWatchlist(syms);
-        setScanStatus("live");
-        setScanCount(gappers.length);
-      } else {
-        // No gappers found — use fallback silently
-        setWatchlist(FALLBACK_WATCHLIST);
-        setScanStatus("fallback");
-        setScanCount(0);
-      }
-      const now = new Date();
-      setLastScan(now.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false,timeZone:"America/New_York"}));
-    } catch(e) {
-      // Scan failed — keep current watchlist, show fallback indicator
-      setWatchlist(FALLBACK_WATCHLIST);
-      setScanStatus("fallback");
-    }
-  }, [isMock]);
-
-  // Step 2: Fetch news for top 10 tickers from current watchlist
-  const fetchNews = useCallback(async (currentWatchlist) => {
-    if (isMock) {
-      setNews(MOCK_NEWS);
-      setLoading(false);
-      return;
-    }
-    try {
-      const today = new Date().toISOString().slice(0, 10);
-      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-      const topTen = currentWatchlist.slice(0, NEWS_TICKER_LIMIT);
-
-      const results = await Promise.allSettled(
+      const today     = new Date().toISOString().slice(0,10);
+      const yesterday = new Date(Date.now()-86400000).toISOString().slice(0,10);
+      const topTen    = watchlist.slice(0, NEWS_TICKER_LIMIT);
+      const results   = await Promise.allSettled(
         topTen.map(sym =>
           fetch(`https://finnhub.io/api/v1/company-news?symbol=${sym}&from=${yesterday}&to=${today}&token=${FINNHUB_API_KEY}`)
-            .then(r => r.json())
-            .then(articles => (Array.isArray(articles) ? articles : []).slice(0, 3).map(a => ({ ...a, sym })))
+            .then(r=>r.json())
+            .then(articles=>(Array.isArray(articles)?articles:[]).slice(0,3).map(a=>({...a,sym})))
         )
       );
-
       const all = results
-        .filter(r => r.status === "fulfilled")
-        .flatMap(r => r.value)
-        .filter(a => a.headline)
-        .sort((a, b) => b.datetime - a.datetime)
-        .slice(0, 30);
-
-      setNews(all.map(a => ({
+        .filter(r=>r.status==="fulfilled")
+        .flatMap(r=>r.value)
+        .filter(a=>a.headline)
+        .sort((a,b)=>b.datetime-a.datetime)
+        .slice(0,30);
+      setNews(all.map(a=>({
         sym: a.sym,
-        time: new Date(a.datetime * 1000).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false,timeZone:"America/New_York"}),
+        time: new Date(a.datetime*1000).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false,timeZone:"America/New_York"}),
         headline: a.headline,
-        source: a.source || "Finnhub",
+        source: a.source||"Finnhub",
         tag: detectTag(a.headline, a.sym),
         url: a.url,
       })));
@@ -918,34 +1071,13 @@ function NewsFeed() {
     } finally {
       setLoading(false);
     }
-  }, [isMock]);
+  }, [isMock, watchlist]);
 
-  // On mount: run gapper scan first, then news
   useEffect(() => {
-    const init = async () => {
-      if (!isMock) await runGapperScan();
-      // watchlist state update from runGapperScan is async, so we read it after a tick
-    };
-    init();
-  }, []);
-
-  // Whenever watchlist changes, fetch news immediately
-  useEffect(() => {
-    fetchNews(watchlist);
-  }, [watchlist, fetchNews]);
-
-  // Refresh news every 60s
-  useEffect(() => {
-    const iv = setInterval(() => fetchNews(watchlist), NEWS_REFRESH_MS);
+    fetchNews();
+    const iv = setInterval(fetchNews, NEWS_REFRESH_MS);
     return () => clearInterval(iv);
-  }, [watchlist, fetchNews]);
-
-  // Re-scan gappers every 5 minutes
-  useEffect(() => {
-    if (isMock) return;
-    const iv = setInterval(runGapperScan, GAPPER_SCAN_MS);
-    return () => clearInterval(iv);
-  }, [runGapperScan, isMock]);
+  }, [fetchNews]);
 
   const TABS = ["All","FDA","Earn","SEC 8-K","⚠ Pump","⬡ MDP"];
 
@@ -977,7 +1109,9 @@ function NewsFeed() {
       <div style={S.ph}>
         <div style={{ fontSize:9, fontWeight:700, letterSpacing:"0.12em", textTransform:"uppercase", color:"#7a90a4", display:"flex", alignItems:"center", gap:5, flexWrap:"wrap" }}>
           <span style={{ color:"#22d3ee" }}>◈</span> News Feed
-          <span style={{ fontSize:7, color:scanStatusColor, fontWeight:600 }}>{scanStatusLabel}</span>
+          {isMock && <span style={{ fontSize:7, color:"#f5a623", fontWeight:600 }}>· MOCK DATA</span>}
+          {!isMock && parentDataSource==="live" && <span style={{ fontSize:7, color:"#00d68f", fontWeight:600 }}>· {watchlist.length} tickers · live</span>}
+          {!isMock && parentDataSource==="error" && <span style={{ fontSize:7, color:"#ff4d6a", fontWeight:600 }}>· backend error · fallback list</span>}
         </div>
         <div style={{ display:"flex", gap:4 }}>
           <Badge variant="live">Finnhub</Badge>
@@ -985,8 +1119,8 @@ function NewsFeed() {
         </div>
       </div>
 
-      {/* Watchlist ticker strip — shows which tickers are being watched */}
-      {!isMock && scanStatus === "live" && watchlist.length > 0 && (
+      {/* Watchlist ticker strip */}
+      {!isMock && watchlist.length > 0 && (
         <div style={{ padding:"3px 10px", background:"rgba(0,214,143,0.03)",
           borderBottom:"1px solid rgba(0,214,143,0.08)", flexShrink:0,
           display:"flex", gap:4, flexWrap:"wrap", alignItems:"center" }}>
@@ -997,9 +1131,6 @@ function NewsFeed() {
               {sym}
             </span>
           ))}
-          {watchlist.length > NEWS_TICKER_LIMIT && (
-            <span style={{ fontSize:7, color:"#3d5166" }}>+{watchlist.length - NEWS_TICKER_LIMIT} more scanning</span>
-          )}
         </div>
       )}
 
@@ -1038,7 +1169,7 @@ function NewsFeed() {
       <div style={S.pscroll}>
         {loading && (
           <div style={{ padding:"20px 12px", textAlign:"center", color:"#3d5166", fontSize:9 }}>
-            {scanStatus === "init" ? "Scanning premarket gappers..." : "Loading news..."}
+            Loading news...
           </div>
         )}
         {error && (
@@ -1315,6 +1446,9 @@ export default function RJTerminal() {
   const [alertsOn, setAlertsOn] = useState(true);
   const [mdpFilter, setMdpFilter] = useState(false);
 
+  // Live data from Railway backend
+  const { gappers, mdpCandidates, pumps, catalystRows, dataSource, lastUpdate, watchlist } = useLiveData();
+
   useEffect(() => {
     const iv = setInterval(() => setWindowStatus(mdpWindowStatus()), 1000);
     return () => clearInterval(iv);
@@ -1341,13 +1475,13 @@ export default function RJTerminal() {
 
       <div style={S.layout}>
         {/* Row 1 */}
-        <GapperScanner mdpFilter={mdpFilter} setMdpFilter={setMdpFilter}/>
-        <CatalystRater/>
-        <MdpWatch windowStatus={windowStatus}/>
+        <GapperScanner mdpFilter={mdpFilter} setMdpFilter={setMdpFilter} gappers={gappers} dataSource={dataSource} lastUpdate={lastUpdate}/>
+        <CatalystRater catalystRows={catalystRows} dataSource={dataSource}/>
+        <MdpWatch windowStatus={windowStatus} mdpCandidates={mdpCandidates}/>
 
         {/* Row 2 */}
-        <PumpScanner/>
-        <NewsFeed/>
+        <PumpScanner pumps={pumps} dataSource={dataSource}/>
+        <NewsFeed watchlist={watchlist} dataSource={dataSource}/>
         <MdpChecklist windowStatus={windowStatus}/>
       </div>
     </div>
